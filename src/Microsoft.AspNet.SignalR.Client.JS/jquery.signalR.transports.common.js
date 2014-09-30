@@ -64,6 +64,98 @@
         return transportLogic.prepareQueryString(connection, url);
     }
 
+    function InitHandler(connection) {
+        this.connection = connection;
+
+        this.startRequested = false;
+        this.startCompleted = false;
+        this.connectionStopped = false;
+    }
+
+    InitHandler.prototype = {
+        start: function (transport, onSuccess, onFallback) {
+            var that = this,
+                connection = this.connection,
+                failCalled = false;
+
+            if (this.transportTimeoutHandle || this.startRequested || this.connectionStopped) {
+                connection.log("WARNING! Cannot start " + transport.name + " transport. Initialization ongoing or completed.");
+            }
+
+            this.transportTimeoutHandle = window.setTimeout(function () {
+                if (!failCalled) {
+                    failCalled = true;
+                    connection.log(transport.name + " timed out when trying to connect.");
+                    that.onTransportFailed(transport, undefined, onFallback);
+                }
+            }, connection._.totalTransportConnectTimeout);
+
+            transport.start(connection, function () {
+                that.onInitReceived(transport, onSuccess);
+            }, function (error) {
+                // We don't want the same transport to cause onFallback to be called twice
+                if (!failCalled) {
+                    failCalled = true;
+                    that.onTransportFailed(transport, error, onFallback);
+                }
+            });
+        },
+
+        stop: function () {
+            this.connectionStopped = true;
+            window.clearTimeout(this.transportTimeoutHandle);
+            signalR.transports._logic.tryAbortStartRequest(this.connection);
+        },
+
+        onInitReceived: function (transport, onSuccess) {
+            var that = this,
+                connection = this.connection;
+
+            if (this.startRequested) {
+                connection.log("WARNING! The client received multiple init messages.");
+                return;
+            }
+
+            if (!this.connectionStopped) {
+                this.startRequested = true;
+                window.clearTimeout(this.transportTimeoutHandle);
+
+                connection.log(transport.name + " transport selected. Initiating start request.");
+                signalR.transports._logic.ajaxStart(connection, function () {
+                    that.startCompleted = true;
+                    onSuccess();
+                });
+            }
+        },
+
+        onTransportFailed: function (transport, error, onFallback) {
+            var connection = this.connection,
+                deferred = connection._deferral,
+                wrappedError;
+
+            if (!this.connectionStopped) {
+                window.clearTimeout(this.transportTimeoutHandle);
+
+                // Do not attempt to fallback if a start request is ongoing during a transport failure.
+                // Instead, trigger an error and stop the connection.
+                if (!this.startRequested) {
+                    transport.stop(connection);
+                    onFallback();
+                } else if (!this.startCompleted) {
+                    wrappedError = signalR._.error(signalR.resources.errorDuringStartRequest, error);
+
+                    connection.log(transport.name + " failed during the start request. Stopping the connection.");
+                    $(connection).triggerHandler(events.onError, [wrappedError]);
+                    if (deferred) {
+                        deferred.reject(wrappedError);
+                    }
+
+                    connection.stop();
+                }
+            }
+        }
+    };
+
     transportLogic = signalR.transports._logic = {
         ajax: function (connection, options) {
             return $.ajax(
@@ -533,12 +625,12 @@
                     return;
                 }
 
+                transport.stop(connection);
+
                 connection._.reconnectTimeout = window.setTimeout(function () {
                     if (!transportLogic.verifyLastActive(connection)) {
                         return;
                     }
-
-                    transport.stop(connection);
 
                     if (transportLogic.ensureReconnectingState(connection)) {
                         connection.log(transportName + " reconnecting.");
@@ -562,6 +654,10 @@
                         context)]);
                 connection.stop();
             }
+        },
+
+        initHandler: function (connection, transport, onSuccess, onFailed) {
+            return new InitHandler(connection, transport, onSuccess, onFailed);
         },
 
         foreverFrame: {

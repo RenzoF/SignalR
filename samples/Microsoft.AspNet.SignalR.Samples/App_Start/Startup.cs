@@ -75,6 +75,8 @@ namespace Microsoft.AspNet.SignalR.Samples
                 EnableDetailedErrors = true
             };
 
+            GlobalHost.Configuration.TransportConnectTimeout = TimeSpan.FromSeconds(15);
+
             app.MapSignalR(config);
 
             BackgroundThread.Start();
